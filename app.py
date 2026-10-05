@@ -231,10 +231,21 @@ def fetch_series_seasons_and_episodes(movie):
                 
             time.sleep(0.12) # 120ms delay
             
-        if e_count == 1 and len(episodes_array) == 1:
-            probe = 2
-            while probe <= 100:
-                stream_info = fetch_stream_url_only(movie_id, s_num, probe, detail_path)
+        # Extra episode prober: API often reports incorrect low episode counts (e.g. 1)
+        if len(episodes_array) > 0:
+            probe = e_count + 1
+            consecutive_fails = 0
+            while probe <= 5000: # Limit increased to 5000 episodes
+                stream_info = None
+                attempts = 0
+                
+                # Retry logic for probe attempts
+                while attempts < 3 and not stream_info:
+                    stream_info = fetch_stream_url_only(movie_id, s_num, probe, detail_path)
+                    if not stream_info:
+                        attempts += 1
+                        if attempts < 3: time.sleep(0.15)
+
                 if stream_info and stream_info.get('url'):
                     episodes_array.append({
                         "downStatus": "off",
@@ -251,10 +262,14 @@ def fetch_series_seasons_and_episodes(movie):
                         "view": 0
                     })
                     print(f"E{probe}✓ ", end="", flush=True)
-                    probe += 1
-                    time.sleep(0.15)
+                    consecutive_fails = 0
                 else:
-                    break
+                    consecutive_fails += 1
+                    if consecutive_fails >= 10:  # টানা ১০ টা এপিসোড না পেলে তবেই থামবে
+                        break
+                
+                probe += 1
+                time.sleep(0.15)
         
         if episodes_array:
             seasons_array.append({
