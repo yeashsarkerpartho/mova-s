@@ -24,7 +24,7 @@ CONFIG = {
     'cooldown_seconds': 8, 
     
     'filter': {
-        'tabId': 1, # TV Series
+        'tabId': 2, # Changed from 1 to 2 for TV Series
         'classify': 'Bengali dub',
         'country': 'All',
         'genre': 'All',
@@ -416,7 +416,6 @@ def main():
         print(f"\n[PAGE {page}] Fetching TV series list...", flush=True)
 
         payload = {
-            'channelId': 1, # Added channelId as requested by API standards
             'tabId': CONFIG['filter']['tabId'],
             'classify': CONFIG['filter']['classify'],
             'country': CONFIG['filter']['country'],
@@ -446,6 +445,12 @@ def main():
         for movie in items:
             mid = str(movie.get('subjectId', movie.get('id', '')))
             title = movie.get('title', movie.get('name', 'Unknown'))
+            subject_type = str(movie.get('subjectType', '2'))
+
+            # Strict check: Exclude standalone movies from series scraper
+            if subject_type == '1':
+                print(f"   ⏭ {title} [Skipped - It is a Movie]", flush=True)
+                continue
 
             if not mid or mid in seen_in_this_run:
                 continue
