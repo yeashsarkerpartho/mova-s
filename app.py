@@ -12,6 +12,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 CONFIG = {
     'base_domain': 'https://themoviebox.xyz',
+    'api_domain': 'https://h5-api.aoneroom.com', # Added new API domain
     'jwt_token': '',
     
     'output_file': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'series_output.json'),
@@ -32,9 +33,10 @@ CONFIG = {
     }
 }
 
-CONFIG['api_url'] = f"{CONFIG['base_domain']}/wefeed-h5api-bff/subject/filter"
-CONFIG['detail_api'] = f"{CONFIG['base_domain']}/wefeed-h5api-bff/subject/detail"
-CONFIG['play_api'] = f"{CONFIG['base_domain']}/wefeed-h5api-bff/subject/play"
+# Updated to use api_domain
+CONFIG['api_url'] = f"{CONFIG['api_domain']}/wefeed-h5api-bff/subject/filter"
+CONFIG['detail_api'] = f"{CONFIG['api_domain']}/wefeed-h5api-bff/subject/detail"
+CONFIG['play_api'] = f"{CONFIG['api_domain']}/wefeed-h5api-bff/subject/play"
 
 # Using requests.Session to handle cookies globally (replacing global_cookie_file)
 session = requests.Session()
@@ -79,7 +81,8 @@ def fetch_initial_token_and_cookie():
         return ""
 
 def request_api(url, payload, token, base_domain):
-    headers = get_stealth_headers(token, base_domain)
+    # The referer and origin should still be the main site
+    headers = get_stealth_headers(token, CONFIG['base_domain']) 
     headers['Content-Type'] = 'application/json'
     
     try:
