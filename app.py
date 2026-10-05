@@ -14,7 +14,7 @@ CONFIG = {
     'base_domain': 'https://themoviebox.xyz',
     'jwt_token': '',
     
-    'output_file': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'b_dubseries.json'),
+    'output_file': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'series_output.json'),
     'start_page': 1,
     'per_page': 24,       
     'delay_ms': 800,      
@@ -203,59 +203,42 @@ def fetch_series_seasons_and_episodes(movie, fallback_token):
             detail_path = "detail"
 
     full_detail_data = fetch_subject_detail(movie_id, detail_path, fallback_token)
-
-    season_list_api = full_detail_data.get('seasonList', full_detail_data.get('seasons', []))
-    seasons_to_scrape = []
-
-    if season_list_api and isinstance(season_list_api, list):
-        for s in season_list_api:
-            s_num = int(s.get('season', s.get('se', 1)))
-            e_list = s.get('episodes', s.get('episodeList', []))
-            
-            if e_list:
-                e_count = len(e_list)
-            else:
-                e_count = int(s.get('episodeCount', s.get('maxEp', s.get('curEpisode', 0))))
-                
-            if e_count == 0:
-                e_count = int(movie.get('curEpisode', movie.get('episodeCount', 1)))
-                
-            seasons_to_scrape.append({
-                'season': s_num,
-                'episodeCount': max(1, e_count)
-            })
-
-    if not seasons_to_scrape:
-        ep_count = int(full_detail_data.get('episodeCount', 
-                       full_detail_data.get('curEpisode', 
-                       movie.get('curEpisode', 
-                       movie.get('episodeCount', 1)))))
-        
-        s_count = int(full_detail_data.get('seasonCount', movie.get('season', 1)))
-        
-        for s in range(1, max(1, s_count) + 1):
-            seasons_to_scrape.append({
-                'season': s,
-                'episodeCount': max(1, ep_count)
-            })
+    poster = get_safe_poster_url(full_detail_data, movie)
 
     seasons_array = []
     overall_quality = "HD"
-    poster = get_safe_poster_url(full_detail_data, movie)
-
-    for s_obj in seasons_to_scrape:
-        s_num = s_obj['season']
-        e_count = s_obj['episodeCount']
-        
+    
+    s_num = 1
+    while s_num <= 50:
         episodes_array = []
-        print(f"\n        └─ Season {s_num} (Target: {e_count} Eps): ", end="", flush=True)
+        e_num = 1
+        consecutive_fails = 0
         
-        for e_num in range(1, e_count + 1):
-            stream_info = fetch_stream_url_only(movie_id, s_num, e_num, detail_path, fallback_token)
+        print(f"\n        └─ Scanning Season {s_num}... ", end="", flush=True)
+
+        while e_num <= 5000:
+            stream_info = None
+            attempts = 0
+
+            # Retries for single episode fetch to bypass temporary network glitches
+            while attempts < 3 and (not stream_info or not stream_info.get('url')):
+                stream_info = fetch_stream_url_only(movie_id, s_num, e_num, detail_path, fallback_token)
+                if not stream_info or not stream_info.get('url'):
+                    attempts += 1
+                    if attempts < 3:
+                        time.sleep(0.15) # 150ms delay between retries
             
+            # Fallback for S0E0 Movie format
+            if (not stream_info or not stream_info.get('url')) and s_num == 1 and e_num == 1:
+                stream_info = fetch_stream_url_only(movie_id, 0, 0, detail_path, fallback_token)
+                if stream_info and stream_info.get('url'):
+                    e_num = 0
+
             if stream_info and stream_info.get('url'):
+                consecutive_fails = 0 # Reset missing counter on success
                 overall_quality = stream_info['quality']
-                
+                ep_title = "Full Movie" if e_num == 0 else f"Ep{e_num}"
+
                 headers_obj = {
                     "Referer": f"{CONFIG['base_domain']}/",
                     "Origin": "",
@@ -266,49 +249,42 @@ def fetch_series_seasons_and_episodes(movie, fallback_token):
                     "downStatus": "off",
                     "downUrl": stream_info['url'],
                     "duration": "--:--",
-                    "episode_title": f"E{e_num}",
+                    "episode_title": ep_title,
                     "headers": headers_obj,
                     "posterUrl": poster,
                     "streamUrl": stream_info['url'],
                     "view": 0
                 })
-                print(f"E{e_num}✓ ", end="", flush=True)
-            else:
-                print(f"E{e_num}✗ ", end="", flush=True)
                 
-            time.sleep(0.15)
-            
-        # Smart Auto-Probe
-        if e_count == 1 and len(episodes_array) == 1:
-            probe = 2
-            while probe <= 100:
-                stream_info = fetch_stream_url_only(movie_id, s_num, probe, detail_path, fallback_token)
-                if stream_info and stream_info.get('url'):
-                    episodes_array.append({
-                        "downStatus": "off",
-                        "downUrl": stream_info['url'],
-                        "duration": "--:--",
-                        "episode_title": f"E{probe}",
-                        "headers": {
-                            "Referer": f"{CONFIG['base_domain']}/",
-                            "Origin": "",
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
-                        },
-                        "posterUrl": poster,
-                        "streamUrl": stream_info['url'],
-                        "view": 0
-                    })
-                    print(f"E{probe}✓ ", end="", flush=True)
-                    probe += 1
-                    time.sleep(0.15)
-                else:
+                print(f"{ep_title}✓ ", end="", flush=True)
+
+                if e_num == 0: 
+                    break # Break if it was a movie
+                e_num += 1
+            else:
+                consecutive_fails += 1
+                # Output gap dot for missing episode
+                print(".", end="", flush=True)
+                
+                # Tolerance: If 25 episodes are missing back-to-back, assume season is over
+                if consecutive_fails >= 25:
                     break
-                    
+                e_num += 1
+                
+            time.sleep(0.12) # 120ms delay to prevent blocking
+
         if episodes_array:
+            season_title = "Movie Stream" if (e_num == 0 or (len(episodes_array) == 1 and episodes_array[0]['episode_title'] == 'Full Movie')) else f"Season {s_num}"
             seasons_array.append({
-                "season_title": f"Season {s_num}",
+                "season_title": season_title,
                 "episodes": episodes_array
             })
+            
+            if e_num == 0 or season_title == "Movie Stream":
+                break
+            s_num += 1
+        else:
+            break
 
     return {
         'fullDetailData': full_detail_data,
