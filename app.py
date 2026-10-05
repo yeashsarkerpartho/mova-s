@@ -14,7 +14,7 @@ CONFIG = {
     'base_domain': 'https://themoviebox.xyz',
     'jwt_token': '',
     
-    'output_file': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'b_dub_series.json'),
+    'output_file': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'b_dubseries.json'),
     'start_page': 1,
     'per_page': 24,       
     'delay_ms': 800,      
@@ -53,6 +53,30 @@ def get_stealth_headers(token="", base_domain=""):
     if token:
         headers['Authorization'] = f"Bearer {token}"
     return headers
+
+def fetch_initial_token_and_cookie():
+    # Fetch token directly from the main filter page (100% success rate usually)
+    url = f"{CONFIG['base_domain']}/web/film?type=/home/movieFilter"
+    headers = get_stealth_headers(base_domain=CONFIG['base_domain'])
+    
+    try:
+        response = session.get(url, headers=headers, timeout=15, verify=False)
+        token = ""
+        
+        # 1. Check cookies first (this session automatically stores them)
+        token = session.cookies.get('mb_auth_token') or session.cookies.get('mb_token')
+        
+        # 2. Fallback to NEXT_DATA extraction from HTML
+        if not token:
+            match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', response.text, re.DOTALL)
+            if match:
+                token_match = re.search(r'"token"\s*:\s*"([a-zA-Z0-9\.\-_]+)"', match.group(1), re.IGNORECASE)
+                if token_match:
+                    token = token_match.group(1)
+        return token
+    except Exception as e:
+        print(f"Error fetching initial token: {e}")
+        return ""
 
 def request_api(url, payload, token, base_domain):
     headers = get_stealth_headers(token, base_domain)
@@ -108,6 +132,9 @@ def fetch_stream_url_only(movie_id, se, ep, detail_path, token):
     play_api_url = f"{CONFIG['play_api']}?subjectId={movie_id}&se={se}&ep={ep}&detailPath={detail_path}&streamSignType=1&supportCodecs%5Bh264%5D=1"
     detail_page_url = f"{CONFIG['base_domain']}/movies/{detail_path}?id={movie_id}&type=/movie/detail&detailSe={se}&detailEp={ep}&lang=en"
 
+    # Use token from session if available, fallback to provided token
+    active_token = session.cookies.get('mb_auth_token') or session.cookies.get('mb_token') or token
+
     api_headers = {
         'accept': 'application/json, text/plain, */*',
         'accept-language': 'en-US,en;q=0.9,bn;q=0.8',
@@ -122,8 +149,8 @@ def fetch_stream_url_only(movie_id, se, ep, detail_path, token):
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36'
     }
 
-    if token:
-        api_headers['authorization'] = f"Bearer {token}"
+    if active_token:
+        api_headers['authorization'] = f"Bearer {active_token}"
 
     try:
         res = session.get(play_api_url, headers=api_headers, timeout=15, verify=False)
@@ -373,6 +400,16 @@ def main():
     print("====================================================")
     print("    MovieBox TV Series Auto Scraper (Python Edition)")
     print("====================================================")
+    
+    # Auto-fetch Token and Setup Cookies before starting
+    print("ℹ️  Initializing engine and fetching auth tokens...", flush=True)
+    auto_token = fetch_initial_token_and_cookie()
+    if auto_token:
+        CONFIG['jwt_token'] = auto_token
+        print("✅ [SUCCESS] Automatically fetched latest auth token & cookies!", flush=True)
+    else:
+        print("⚠️ [WARNING] Failed to fetch auto token, continuing with default setup...", flush=True)
+
     print("ℹ️  Engine ready. Fetching series data...", flush=True)
 
     all_series = []
@@ -400,6 +437,7 @@ def main():
         print(f"\n[PAGE {page}] Fetching TV series list...", flush=True)
 
         payload = {
+            'channelId': 1, # Added channelId as requested by API standards
             'tabId': CONFIG['filter']['tabId'],
             'classify': CONFIG['filter']['classify'],
             'country': CONFIG['filter']['country'],
