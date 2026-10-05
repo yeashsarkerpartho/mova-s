@@ -14,7 +14,7 @@ CONFIG = {
     'base_domain': 'https://themoviebox.xyz',
     'jwt_token': '',
     
-    'output_file': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'b_dubseries.json'),
+    'output_file': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'b_dub_series.json'),
     'start_page': 1,
     'per_page': 24,       
     'delay_ms': 800,      
