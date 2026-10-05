@@ -7,12 +7,11 @@ import urllib.parse
 import urllib3
 import requests
 
-# Suppress InsecureRequestWarning if strictly bypassing SSL verification (like CURLOPT_SSL_VERIFYPEER = false)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 CONFIG = {
     'base_domain': 'https://themoviebox.xyz',
-    'api_domain': 'https://h5-api.aoneroom.com', # Added new API domain
+    'api_domain': 'https://h5-api.aoneroom.com',
     'jwt_token': '',
     
     'output_file': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'series_output.json'),
@@ -22,107 +21,124 @@ CONFIG = {
     
     'cooldown_every_pages': 10,
     'cooldown_seconds': 8, 
+    'delay_between_episodes_ms': 120, # From PHP Logic
     
     'filter': {
-        'tabId': 2, # Changed from 1 to 2 for TV Series
+        'tabId': 2, # 2 means strictly TV Shows
         'classify': 'Bengali dub',
         'country': 'All',
         'genre': 'All',
         'sort': 'ForYou', 
         'year': 'All'
-    }
+    },
+    'category_name': 'Bengali Collection' # From PHP Logic
 }
 
-# Updated to use api_domain
 CONFIG['api_url'] = f"{CONFIG['api_domain']}/wefeed-h5api-bff/subject/filter"
 CONFIG['detail_api'] = f"{CONFIG['api_domain']}/wefeed-h5api-bff/subject/detail"
 CONFIG['play_api'] = f"{CONFIG['api_domain']}/wefeed-h5api-bff/subject/play"
 
-# Using requests.Session to handle cookies globally (replacing global_cookie_file)
 session = requests.Session()
 
-def get_stealth_headers(token="", base_domain=""):
+def get_stealth_headers(token="", base_domain="", referer="", is_cross_site=False):
     headers = {
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'en-US,en;q=0.9,bn;q=0.8',
-        'Origin': base_domain,
-        'Referer': f"{base_domain}/",
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
         'sec-ch-ua': '"Google Chrome";v="127", "Chromium";v="127", "Not.A/Brand";v="24"',
         'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"'
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        # CRITICAL FIX: Must be cross-site when calling api_domain from base_domain
+        'sec-fetch-site': 'cross-site' if is_cross_site else 'same-origin'
     }
+    
+    if base_domain:
+        headers['Origin'] = base_domain
+    if referer:
+        headers['Referer'] = referer
+    elif base_domain:
+        headers['Referer'] = f"{base_domain}/"
+
     if token:
         headers['Authorization'] = f"Bearer {token}"
+        
     return headers
 
 def fetch_initial_token_and_cookie():
-    # Fetch token directly from the main filter page (100% success rate usually)
-    url = f"{CONFIG['base_domain']}/web/film?type=/home/movieFilter"
-    headers = get_stealth_headers(base_domain=CONFIG['base_domain'])
+    url = f"{CONFIG['base_domain']}/"
+    headers = get_stealth_headers(base_domain=CONFIG['base_domain'], is_cross_site=False)
     
     try:
-        response = session.get(url, headers=headers, timeout=15, verify=False)
+        res = session.get(url, headers=headers, timeout=15, verify=False)
         token = ""
         
-        # 1. Check cookies first (this session automatically stores them)
-        token = session.cookies.get('mb_auth_token') or session.cookies.get('mb_token')
-        
-        # 2. Fallback to NEXT_DATA extraction from HTML
+        # 1. Next.js data extraction
+        match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', res.text, re.DOTALL)
+        if match:
+            t_match = re.search(r'"token"\s*:\s*"([a-zA-Z0-9\.\-_]+)"', match.group(1), re.IGNORECASE)
+            if t_match:
+                token = t_match.group(1)
+                
+        # 2. Generic Token Fallback from PHP script
         if not token:
-            match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', response.text, re.DOTALL)
-            if match:
-                token_match = re.search(r'"token"\s*:\s*"([a-zA-Z0-9\.\-_]+)"', match.group(1), re.IGNORECASE)
-                if token_match:
-                    token = token_match.group(1)
+            t_match = re.search(r'"(?:accessToken|jwtToken|token)"\s*:\s*"([a-zA-Z0-9\.\-_]{20,})"', res.text, re.IGNORECASE)
+            if t_match:
+                token = t_match.group(1)
+                
+        # 3. Direct Cookie extraction
+        if not token:
+            for cookie in session.cookies:
+                if cookie.name in ['mb_auth_token', 'mb_token']:
+                    token = cookie.value
+                    break
+                    
         return token
     except Exception as e:
         print(f"Error fetching initial token: {e}")
         return ""
 
 def request_api(url, payload, token, base_domain):
-    # The referer and origin should still be the main site
-    headers = get_stealth_headers(token, CONFIG['base_domain']) 
+    headers = get_stealth_headers(token, base_domain, is_cross_site=True)
     headers['Content-Type'] = 'application/json'
     
     try:
-        response = session.post(
-            url, 
-            json=payload, 
-            headers=headers, 
-            timeout=20, 
-            verify=False
-        )
+        # CRITICAL FIX: Manually forcing cookies because Python isolates cookies across different domains natively
+        cookies_dict = requests.utils.dict_from_cookiejar(session.cookies)
+        response = session.post(url, json=payload, headers=headers, cookies=cookies_dict, timeout=20, verify=False)
+        
         if response.status_code == 200:
             return response.json()
-    except Exception as e:
+    except Exception:
         pass
     return None
 
 def get_safe_poster_url(data, fallback):
-    cover = data.get('cover')
-    if cover:
-        if isinstance(cover, dict) and cover.get('url'):
-            return str(cover['url'])
-        if isinstance(cover, str):
-            return cover
+    possible_keys = ['cover', 'verticalCover', 'horizontalCover', 'poster', 'thumb', 'image', 'pic']
+    for k in possible_keys:
+        val = data.get(k)
+        if val:
+            if isinstance(val, str) and val.startswith('http'): return val
+            if isinstance(val, dict) and val.get('url'): return val['url']
             
-    fallback_cover = fallback.get('cover')
-    if fallback_cover:
-        if isinstance(fallback_cover, dict) and fallback_cover.get('url'):
-            return str(fallback_cover['url'])
-        if isinstance(fallback_cover, str):
-            return fallback_cover
-            
+    for k in possible_keys:
+        val = fallback.get(k)
+        if val:
+            if isinstance(val, str) and val.startswith('http'): return val
+            if isinstance(val, dict) and val.get('url'): return val['url']
     return ""
 
 def fetch_subject_detail(movie_id, detail_path, token):
     encoded_path = urllib.parse.quote(detail_path)
     detail_url = f"{CONFIG['detail_api']}?subjectId={movie_id}&detailPath={encoded_path}"
-    headers = get_stealth_headers(token, CONFIG['base_domain'])
+    detail_page_url = f"{CONFIG['base_domain']}/detail/{detail_path}?id={movie_id}&scene=&page_from=rank_detail&type=/movie/detail"
+    
+    headers = get_stealth_headers(token, CONFIG['base_domain'], detail_page_url, is_cross_site=True)
     
     try:
-        res = session.get(detail_url, headers=headers, timeout=15, verify=False)
+        cookies_dict = requests.utils.dict_from_cookiejar(session.cookies)
+        res = session.get(detail_url, headers=headers, cookies=cookies_dict, timeout=15, verify=False)
         if res.status_code == 200:
             data = res.json()
             if data.get('data') and isinstance(data['data'], dict):
@@ -135,65 +151,42 @@ def fetch_stream_url_only(movie_id, se, ep, detail_path, token):
     play_api_url = f"{CONFIG['play_api']}?subjectId={movie_id}&se={se}&ep={ep}&detailPath={detail_path}&streamSignType=1&supportCodecs%5Bh264%5D=1"
     detail_page_url = f"{CONFIG['base_domain']}/movies/{detail_path}?id={movie_id}&type=/movie/detail&detailSe={se}&detailEp={ep}&lang=en"
 
-    # Use token from session if available, fallback to provided token
-    active_token = session.cookies.get('mb_auth_token') or session.cookies.get('mb_token') or token
-
-    api_headers = {
-        'accept': 'application/json, text/plain, */*',
-        'accept-language': 'en-US,en;q=0.9,bn;q=0.8',
-        'origin': CONFIG['base_domain'],
-        'referer': detail_page_url,
-        'sec-ch-ua': '"Google Chrome";v="127", "Chromium";v="127", "Not.A/Brand";v="24"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36'
-    }
-
-    if active_token:
-        api_headers['authorization'] = f"Bearer {active_token}"
+    active_token = token
+    for cookie in session.cookies:
+        if cookie.name in ['mb_auth_token', 'mb_token']:
+            active_token = cookie.value
+            
+    api_headers = get_stealth_headers(active_token, CONFIG['base_domain'], detail_page_url, is_cross_site=True)
 
     try:
-        res = session.get(play_api_url, headers=api_headers, timeout=15, verify=False)
-        if res.status_code != 200:
+        cookies_dict = requests.utils.dict_from_cookiejar(session.cookies)
+        res = session.get(play_api_url, headers=api_headers, cookies=cookies_dict, timeout=15, verify=False)
+        if res.status_code != 200: 
             return None
         
         data = res.json()
-        if not data.get('data'):
+        if not data.get('data'): 
             return None
             
         final_url = ""
         quality = "HD"
         
         if data['data'].get('streams'):
-            mp4_list = {}
-            for st in data['data']['streams']:
-                if st.get('url'):
-                    res_val = int(st.get('resolutions', 0))
-                    mp4_list[res_val] = st
-                    
+            mp4_list = {int(st.get('resolutions', 0)): st for st in data['data']['streams'] if st.get('url')}
             if mp4_list:
-                # Get highest resolution
                 best_res = max(mp4_list.keys())
-                best_mp4 = mp4_list[best_res]
                 quality = f"{best_res}p"
-                final_url = best_mp4['url']
+                final_url = mp4_list[best_res]['url']
                 
         elif data['data'].get('dash') and data['data']['dash'][0].get('url'):
             quality = 'DASH'
             final_url = data['data']['dash'][0]['url']
             
-        if not final_url:
-            return None
-            
-        return {
-            'url': final_url,
-            'quality': quality
-        }
+        if final_url:
+            return {'url': final_url, 'quality': quality}
     except Exception:
-        return None
+        pass
+    return None
 
 def fetch_series_seasons_and_episodes(movie, fallback_token):
     movie_id = str(movie.get('subjectId', movie.get('id', '')))
@@ -206,39 +199,45 @@ def fetch_series_seasons_and_episodes(movie, fallback_token):
             detail_path = "detail"
 
     full_detail_data = fetch_subject_detail(movie_id, detail_path, fallback_token)
+    if full_detail_data and full_detail_data.get('title'):
+        title = full_detail_data['title']
+
     poster = get_safe_poster_url(full_detail_data, movie)
+    if full_detail_data.get('resolvedPosterUrl'):
+        poster = full_detail_data['resolvedPosterUrl']
 
     seasons_array = []
     overall_quality = "HD"
+    total_episodes_found = 0
     
     s_num = 1
+    # Mirrored 50 Seasons & 5000 Episodes Limit exactly as PHP
     while s_num <= 50:
         episodes_array = []
         e_num = 1
         consecutive_fails = 0
         
-        print(f"\n        └─ Scanning Season {s_num}... ", end="", flush=True)
+        print(f"\n        └─ Season {s_num}: ", end="", flush=True)
 
         while e_num <= 5000:
             stream_info = None
             attempts = 0
 
-            # Retries for single episode fetch to bypass temporary network glitches
-            while attempts < 3 and (not stream_info or not stream_info.get('url')):
+            while attempts < 3 and not stream_info:
                 stream_info = fetch_stream_url_only(movie_id, s_num, e_num, detail_path, fallback_token)
-                if not stream_info or not stream_info.get('url'):
+                if not stream_info:
                     attempts += 1
-                    if attempts < 3:
-                        time.sleep(0.15) # 150ms delay between retries
+                    if attempts < 3: 
+                        time.sleep(0.15)
             
-            # Fallback for S0E0 Movie format
-            if (not stream_info or not stream_info.get('url')) and s_num == 1 and e_num == 1:
+            # S0E0 Movie format fallback
+            if not stream_info and s_num == 1 and e_num == 1:
                 stream_info = fetch_stream_url_only(movie_id, 0, 0, detail_path, fallback_token)
-                if stream_info and stream_info.get('url'):
+                if stream_info:
                     e_num = 0
 
             if stream_info and stream_info.get('url'):
-                consecutive_fails = 0 # Reset missing counter on success
+                consecutive_fails = 0
                 overall_quality = stream_info['quality']
                 ep_title = "Full Movie" if e_num == 0 else f"Ep{e_num}"
 
@@ -259,22 +258,22 @@ def fetch_series_seasons_and_episodes(movie, fallback_token):
                     "view": 0
                 })
                 
+                total_episodes_found += 1
                 print(f"{ep_title}✓ ", end="", flush=True)
 
                 if e_num == 0: 
-                    break # Break if it was a movie
+                    break 
                 e_num += 1
             else:
                 consecutive_fails += 1
-                # Output gap dot for missing episode
                 print(".", end="", flush=True)
                 
-                # Tolerance: If 25 episodes are missing back-to-back, assume season is over
+                # 25 consecutive fails means season ends
                 if consecutive_fails >= 25:
                     break
                 e_num += 1
                 
-            time.sleep(0.12) # 120ms delay to prevent blocking
+            time.sleep(CONFIG['delay_between_episodes_ms'] / 1000.0)
 
         if episodes_array:
             season_title = "Movie Stream" if (e_num == 0 or (len(episodes_array) == 1 and episodes_array[0]['episode_title'] == 'Full Movie')) else f"Season {s_num}"
@@ -292,95 +291,75 @@ def fetch_series_seasons_and_episodes(movie, fallback_token):
     return {
         'fullDetailData': full_detail_data,
         'seasons': seasons_array,
-        'quality': overall_quality
+        'quality': overall_quality,
+        'resolvedTitle': title,
+        'resolvedPoster': poster,
+        'totalEpisodesFound': total_episodes_found
     }
 
-def extract_trailer_url(trailer_data):
-    if not trailer_data:
-        return ""
-    if isinstance(trailer_data, str) and trailer_data.startswith('http'):
-        return trailer_data
-    if isinstance(trailer_data, dict):
-        if trailer_data.get('videoAddress', {}).get('url'):
-            return trailer_data['videoAddress']['url']
-        if trailer_data.get('url'):
-            return trailer_data['url']
-        if trailer_data.get('videoUrl'):
-            return trailer_data['videoUrl']
-    return ""
-
 def format_to_desired_json(movie, series_data):
-    full_data = {**movie, **series_data.get('fullDetailData', {})}
-    
-    release_date = str(full_data.get('releaseDate', full_data.get('year', '')))
+    full_data = series_data.get('fullDetailData', {})
+    title = series_data.get('resolvedTitle', movie.get('title', 'Unknown'))
+    release_date = str(full_data.get('releaseDate', full_data.get('year', movie.get('releaseDate', ''))))
+
     year = ""
-    yr_matches = re.search(r'(\d{4})', release_date)
-    if yr_matches:
+    yr_matches = re.search(r'\b(19\d{2}|20\d{2})\b', release_date)
+    if yr_matches: 
         year = yr_matches.group(1)
 
-    raw_title = str(full_data.get('title', full_data.get('name', 'Unknown'))).strip()
-    clean_title = re.sub(r'\[.*?\]', '', raw_title).strip()
+    clean_title = title
+    clean_title = re.sub(r'^Watch\s+', '', clean_title, flags=re.IGNORECASE)
+    clean_title = re.sub(r'\s*Streaming\s+Online.*$', '', clean_title, flags=re.IGNORECASE)
+    clean_title = re.sub(r'\s*on\s+Movie[s]?Box.*$', '', clean_title, flags=re.IGNORECASE)
+    clean_title = re.sub(r'\[.*?\]', '', clean_title)
+    clean_title = re.sub(r'\((?:19\d{2}|20\d{2})\)', '', clean_title)
     clean_title = re.sub(r'\s+', ' ', clean_title).strip()
     
-    title_with_year = clean_title
-    if year and f"({year})" not in clean_title:
-        title_with_year = f"{clean_title} ({year})"
+    final_title = f"{clean_title} ({year})" if year and f"({year})" not in clean_title else clean_title
 
-    genres = ["Unknown"]
+    poster = series_data.get('resolvedPoster', '')
+    if not poster: 
+        poster = get_safe_poster_url(full_data, movie)
+
+    raw_storyline = str(full_data.get('description', full_data.get('brief', '')))
+    clean_storyline = re.sub(r'free\s+streaming\s+online\s+on\s+Movie[s]?Box', 'MY TV', raw_storyline, flags=re.IGNORECASE)
+    clean_storyline = re.sub(r'streaming\s+online\s+on\s+Movie[s]?Box', 'MY TV', clean_storyline, flags=re.IGNORECASE)
+    clean_storyline = re.sub(r'Movie[s]?Box', 'MY TV', clean_storyline, flags=re.IGNORECASE)
+    clean_storyline = re.sub(r'\s+', ' ', clean_storyline).strip()
+
+    genres = ["Drama"]
     if full_data.get('genre'):
         if isinstance(full_data['genre'], list):
             genres = full_data['genre']
         else:
             genres = [g.strip() for g in full_data['genre'].split(',')]
-        genres = [g for g in genres if g]
-        if not genres:
-            genres = ["Unknown"]
-
-    director = 'N/A'
-    if full_data.get('staffList') and isinstance(full_data['staffList'], list):
-        directors = [staff['name'] for staff in full_data['staffList'] if str(staff.get('staffType')) == '2']
-        if directors:
-            director = ', '.join(directors)
-        elif full_data['staffList'] and full_data['staffList'][0].get('name'):
-            director = full_data['staffList'][0]['name']
-
-    trailer_url = extract_trailer_url(full_data.get('trailer'))
-    
-    storyline = ""
-    if full_data.get('description'):
-        storyline = str(full_data['description']).strip()
-    elif full_data.get('brief'):
-        storyline = str(full_data['brief']).strip()
-
-    poster_url = get_safe_poster_url(series_data.get('fullDetailData', {}), movie)
 
     return {
-        "category": str(CONFIG['filter']['classify']),
-        "director": director,
-        "genre": genres,
-        "imdbRating": float(full_data.get('imdbRatingValue', full_data.get('score', full_data.get('rating', 0.0)))),
-        "imdbVotes": int(full_data.get('imdbRatingCount', full_data.get('votes', 0))),
-        "language": str(full_data.get('corner', full_data.get('language', 'Unknown'))),
-        "posterUrl": poster_url,
-        "premium": bool(full_data.get('isVip')),
+        "category": CONFIG['category_name'],
+        "director": "N/A",
+        "genre": [g for g in genres if g],
+        "imdbRating": float(full_data.get('imdbRatingValue', full_data.get('score', 7.8))),
+        "imdbVotes": int(full_data.get('imdbRatingCount', 0)),
+        "language": str(full_data.get('language', 'Bengali')),
+        "posterUrl": str(poster),
+        "premium": False,
         "quality": str(series_data.get('quality', 'HD')),
-        "releaseDate": release_date,
+        "releaseDate": str(release_date),
         "resolution": str(series_data.get('quality', 'HD')),
         "seasons": series_data.get('seasons', []),
         "sliderStatus": "off",
         "sliderUrl": "",
         "status": "on",
-        "storyline": storyline,
-        "title": title_with_year,
-        "triler": trailer_url
+        "storyline": clean_storyline,
+        "title": final_title,
+        "triler": ""
     }
 
 def main():
     print("====================================================")
-    print("    MovieBox TV Series Auto Scraper (Python Edition)")
+    print("    MovieBox TV Series Live Scraper (Python Edition)")
     print("====================================================")
     
-    # Auto-fetch Token and Setup Cookies before starting
     print("ℹ️  Initializing engine and fetching auth tokens...", flush=True)
     auto_token = fetch_initial_token_and_cookie()
     if auto_token:
@@ -388,8 +367,6 @@ def main():
         print("✅ [SUCCESS] Automatically fetched latest auth token & cookies!", flush=True)
     else:
         print("⚠️ [WARNING] Failed to fetch auto token, continuing with default setup...", flush=True)
-
-    print("ℹ️  Engine ready. Fetching series data...", flush=True)
 
     all_series = []
     series_map = {}
@@ -409,8 +386,7 @@ def main():
             print(f"[WARNING] Could not read existing JSON: {e}")
 
     page = CONFIG['start_page']
-    per_page = CONFIG['per_page']
-    pages_scraped_in_batch = 0
+    pages_scraped = 0
 
     while True:
         print(f"\n[PAGE {page}] Fetching TV series list...", flush=True)
@@ -423,13 +399,13 @@ def main():
             'sort': CONFIG['filter']['sort'],
             'year': CONFIG['filter']['year'],
             'page': page,
-            'perPage': per_page
+            'perPage': CONFIG['per_page']
         }
 
         response = request_api(CONFIG['api_url'], payload, CONFIG['jwt_token'], CONFIG['base_domain'])
 
         if not response:
-            print("[STOP] API connection failed.", flush=True)
+            print("[STOP] API connection failed. Terminating.", flush=True)
             break
 
         items = response.get('data', {}).get('list', response.get('data', {}).get('items', []))
@@ -437,7 +413,7 @@ def main():
         print(f" -> Found: {count} items.", flush=True)
 
         if count == 0:
-            print("🎉 [COMPLETE] No more series left!", flush=True)
+            print("🎉 [COMPLETE] No more items left!", flush=True)
             break
 
         processed_this_page = 0
@@ -445,12 +421,6 @@ def main():
         for movie in items:
             mid = str(movie.get('subjectId', movie.get('id', '')))
             title = movie.get('title', movie.get('name', 'Unknown'))
-            subject_type = str(movie.get('subjectType', '2'))
-
-            # Strict check: Exclude standalone movies from series scraper
-            if subject_type == '1':
-                print(f"   ⏭ {title} [Skipped - It is a Movie]", flush=True)
-                continue
 
             if not mid or mid in seen_in_this_run:
                 continue
@@ -468,27 +438,25 @@ def main():
 
             formatted = format_to_desired_json(movie, series_data)
             
-            is_existing = formatted['title'] in series_map
-            if is_existing:
+            if formatted['title'] in series_map:
                 idx = series_map[formatted['title']]
                 all_series[idx] = formatted
-                print("\n      [Success - Updated]", flush=True)
+                print(f"\n      [Success - Updated {series_data['totalEpisodesFound']} Eps]", flush=True)
             else:
                 all_series.append(formatted)
                 series_map[formatted['title']] = len(all_series) - 1
-                print("\n      [Success - Added New Series]", flush=True)
+                print(f"\n      [Success - Added New {series_data['totalEpisodesFound']} Eps]", flush=True)
                 
         if processed_this_page == 0:
             print("🛑 [LOOP DETECTED] Server repeating data. Terminated.", flush=True)
             break
 
-        # Save to JSON
         with open(CONFIG['output_file'], 'w', encoding='utf-8') as f:
             json.dump(all_series, f, indent=4, ensure_ascii=False)
 
-        pages_scraped_in_batch += 1
-        if CONFIG['cooldown_every_pages'] > 0 and (pages_scraped_in_batch % CONFIG['cooldown_every_pages'] == 0):
-            print(f"\n☕ [Cooldown] {CONFIG['cooldown_every_pages']} pages done. Waiting {CONFIG['cooldown_seconds']}s...", flush=True)
+        pages_scraped += 1
+        if CONFIG['cooldown_every_pages'] > 0 and (pages_scraped % CONFIG['cooldown_every_pages'] == 0):
+            print(f"\n☕ [Cooldown] Waiting {CONFIG['cooldown_seconds']}s...", flush=True)
             time.sleep(CONFIG['cooldown_seconds'])
         else:
             time.sleep(CONFIG['delay_ms'] / 1000.0)
