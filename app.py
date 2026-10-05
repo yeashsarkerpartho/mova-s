@@ -162,19 +162,37 @@ def fetch_series_seasons_and_episodes(movie):
         if int(subject_type) == 1:
             return None # 1 means Movie, skip it
             
+    season_list_api = full_detail_data.get('seasonList') or full_detail_data.get('seasons') or []
+    seasons_to_scrape = []
+    
+    if season_list_api and isinstance(season_list_api, list):
+        for s in season_list_api:
+            s_num = int(s.get('season') or s.get('se') or 1)
+            e_list = s.get('episodes') or s.get('episodeList') or []
+            e_count = len(e_list) if e_list else int(s.get('episodeCount') or s.get('maxEp') or s.get('curEpisode') or 0)
+            if e_count == 0:
+                e_count = int(movie.get('curEpisode') or movie.get('episodeCount') or 1)
+            seasons_to_scrape.append({'season': s_num, 'episodeCount': max(1, e_count)})
+            
+    # Fallback if seasonList is missing
+    if not seasons_to_scrape:
+        ep_count = int(full_detail_data.get('episodeCount') or full_detail_data.get('curEpisode') or movie.get('curEpisode') or movie.get('episodeCount') or 1)
+        s_count = int(full_detail_data.get('seasonCount') or movie.get('season') or 1)
+        for s in range(1, max(1, s_count) + 1):
+            seasons_to_scrape.append({'season': s, 'episodeCount': max(1, ep_count)})
+
     seasons_array = []
     overall_quality = "HD"
     poster = get_safe_poster_url(full_detail_data, movie)
     
-    s_num = 1
-    while s_num <= 50:
+    for s_obj in seasons_to_scrape:
+        s_num = s_obj['season']
+        e_count = s_obj['episodeCount']
+        
         episodes_array = []
-        e_num = 1
-        consecutive_fails = 0
+        print(f"\n        └─ Season {s_num} (Target: {e_count} Eps): ", end="", flush=True)
         
-        print(f"\n        └─ Season {s_num}: ", end="", flush=True)
-        
-        while e_num <= 5000:
+        for e_num in range(1, e_count + 1):
             stream_info = None
             attempts = 0
             
@@ -185,15 +203,13 @@ def fetch_series_seasons_and_episodes(movie):
                     attempts += 1
                     if attempts < 3: time.sleep(0.15)
                     
-            # Fallback for S0E0 Movie format
+            # Fallback for S0E0 Movie format if exactly 1 episode
             if not stream_info and s_num == 1 and e_num == 1:
                 stream_info = fetch_stream_url_only(movie_id, 0, 0, detail_path)
-                if stream_info: e_num = 0
                 
             if stream_info and stream_info.get('url'):
-                consecutive_fails = 0 # Reset fails on success
                 overall_quality = stream_info['quality']
-                ep_title = "Full Movie" if e_num == 0 else f"E{e_num}"
+                ep_title = f"E{e_num}"
                 
                 episodes_array.append({
                     "downStatus": "off",
@@ -209,30 +225,43 @@ def fetch_series_seasons_and_episodes(movie):
                     "streamUrl": stream_info['url'],
                     "view": 0
                 })
-                print(f"{ep_title}✓ ", end="", flush=True)
-                if e_num == 0: break
-                e_num += 1
+                print(f"E{e_num}✓ ", end="", flush=True)
             else:
-                consecutive_fails += 1
-                print(".", end="", flush=True)
-                # Tolerance: Break if 25 consecutive episodes are missing
-                if consecutive_fails >= 25:
-                    break
-                e_num += 1
+                print(f"E{e_num}✗ ", end="", flush=True)
                 
             time.sleep(0.12) # 120ms delay
             
+        if e_count == 1 and len(episodes_array) == 1:
+            probe = 2
+            while probe <= 100:
+                stream_info = fetch_stream_url_only(movie_id, s_num, probe, detail_path)
+                if stream_info and stream_info.get('url'):
+                    episodes_array.append({
+                        "downStatus": "off",
+                        "downUrl": stream_info['url'],
+                        "duration": "--:--",
+                        "episode_title": f"E{probe}",
+                        "headers": {
+                            "Referer": f"{CONFIG['base_domain']}/",
+                            "Origin": "",
+                            "User-Agent": get_stealth_headers()['User-Agent']
+                        },
+                        "posterUrl": poster,
+                        "streamUrl": stream_info['url'],
+                        "view": 0
+                    })
+                    print(f"E{probe}✓ ", end="", flush=True)
+                    probe += 1
+                    time.sleep(0.15)
+                else:
+                    break
+        
         if episodes_array:
-            season_title = "Movie Stream" if (e_num == 0 or (len(episodes_array) == 1 and episodes_array[0]['episode_title'] == 'Full Movie')) else f"Season {s_num}"
             seasons_array.append({
-                "season_title": season_title,
+                "season_title": f"Season {s_num}",
                 "episodes": episodes_array
             })
-            if e_num == 0 or season_title == "Movie Stream": break
-            s_num += 1
-        else:
-            break
-            
+
     return {
         'fullDetailData': full_detail_data,
         'seasons': seasons_array,
