@@ -246,23 +246,25 @@ def fetch_series_seasons_and_episodes(movie):
     overall_quality = "HD"
     poster = get_safe_poster_url(full_detail_data, movie)
     
-    # === DYNAMIC SEASON PROBER ===
-    min_known_season = min([s['season'] for s in seasons_to_scrape]) if seasons_to_scrape else 1
-    max_known_season = max([s['season'] for s in seasons_to_scrape]) if seasons_to_scrape else 1
+    # === DYNAMIC SPARSE SEASON PROBER ===
+    known_seasons_map = {s['season']: s['episodeCount'] for s in seasons_to_scrape}
+    seasons_to_process = set(known_seasons_map.keys())
     
-    s_num = min_known_season
-    missing_seasons = 0
+    # ১. সর্বদা অন্তত ১ থেকে ৫ সিজন প্রোব করবে (মাঝখানে কোনোটা মিসিং থাকলেও যাতে ধরে ফেলে)
+    seasons_to_process.update([1, 2, 3, 4, 5])
     
-    while s_num <= max(50, max_known_season + 2) and missing_seasons < 2:
-        e_count = 1
-        for s_obj in seasons_to_scrape:
-            if s_obj['season'] == s_num:
-                e_count = s_obj['episodeCount']
-                break
+    # ২. API তে যদি অনেক বড় সিজন থাকে (যেমন ১২), তার পরের আরও ২টি সিজন চেক করবে
+    if seasons_to_process:
+        max_s = max(seasons_to_process)
+        seasons_to_process.update([max_s + 1, max_s + 2])
+        
+    sorted_seasons = sorted(list(seasons_to_process))
+    
+    for s_num in sorted_seasons:
+        e_count = known_seasons_map.get(s_num, 1) # টার্গেট এপিসোড, না জানলে ডিফল্ট 1
                 
         if e_count > CONFIG['max_episodes_limit']:
             print(f"\n        └─ Season {s_num}: SKIPPED (Exceeds limit)")
-            s_num += 1
             continue
             
         print(f"\n        └─ Season {s_num} (Target: {e_count} Eps): ", end="", flush=True)
@@ -278,9 +280,9 @@ def fetch_series_seasons_and_episodes(movie):
                     overall_quality = stream_info['quality']
                     episodes_data_map[ep_num] = format_episode_dict(ep_num, stream_info, poster)
                     
-        # Step 2: Smart Prober (Reduced aggression to prevent WAF IP Blocks)
+        # Step 2: Smart Prober (Hidden Episodes)
         found_any = len(episodes_data_map) > 0
-        max_fails = 5 if found_any else 2 
+        max_fails = 6 if found_any else 3 # কোনো এপিসোড না পেলে তাড়াতাড়ি স্কিপ করবে
         
         probe_start = max(1, e_count) + 1
         consecutive_fails = 0
@@ -303,11 +305,11 @@ def fetch_series_seasons_and_episodes(movie):
                 consecutive_fails += len(probe_batch)
             else:
                 consecutive_fails = 0
-                max_fails = 5 # Extend probing if we found a hidden episode
+                max_fails = 6 # Extend probing if we found a hidden episode
                 
             probe_start += len(probe_batch)
             if consecutive_fails < max_fails:
-                time.sleep(0.4) # WAF Anti-ban delay between batches
+                time.sleep(0.3) # WAF Anti-ban delay between batches
             
         # Finalize and sort Season
         if episodes_data_map:
@@ -316,13 +318,8 @@ def fetch_series_seasons_and_episodes(movie):
                 "season_title": f"Season {s_num}",
                 "episodes": sorted_eps
             })
-            missing_seasons = 0
         else:
             print(" [No episodes found]", end="")
-            if s_num >= max_known_season:
-                missing_seasons += 1
-
-        s_num += 1
 
     return {
         'fullDetailData': full_detail_data,
