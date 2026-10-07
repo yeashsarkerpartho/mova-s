@@ -30,6 +30,7 @@ CONFIG = {
     'max_threads': 8,          # একসাথে ৮টি এপিসোড ফেচ করবে (Speed up)
     'max_episodes_limit': 300, # এক সিজনে সর্বোচ্চ ৩০০ এপিসোড ফেচ করবে বা স্কিপ করবে
     
+    'always_start_from_page_1': True, # ২২ ঘণ্টা পর পর সব লিংক রিফ্রেশ করার জন্য
     'strict_series_only': True, # শুধু সিরিজ সেভ করবে, মুভি বাতিল করবে
     
     'filter': {
@@ -371,15 +372,22 @@ def main():
             print(f"[WARN] Error reading existing JSON: {e}")
             
     page = CONFIG['start_page']
-    if os.path.exists(CONFIG['progress_file']):
-        try:
-            with open(CONFIG['progress_file'], 'r') as f:
-                saved_page = int(f.read().strip())
-                if saved_page > 0:
-                    page = saved_page
-                    print(f"[INFO] Resuming from Page: {page}")
-        except Exception:
-            pass
+    
+    # 22h Auto Run এর জন্য Resume অপশন মডিফাই করা হলো
+    if CONFIG.get('always_start_from_page_1', True):
+        print("[INFO] always_start_from_page_1 is TRUE. Starting from Page 1 to refresh all stream links...")
+        if os.path.exists(CONFIG['progress_file']):
+            os.remove(CONFIG['progress_file']) # পুরানো প্রগ্রেস মুছে দিলাম
+    else:
+        if os.path.exists(CONFIG['progress_file']):
+            try:
+                with open(CONFIG['progress_file'], 'r') as f:
+                    saved_page = int(f.read().strip())
+                    if saved_page > 0:
+                        page = saved_page
+                        print(f"[INFO] Resuming from Page: {page}")
+            except Exception:
+                pass
             
     per_page = CONFIG['per_page']
     pages_scraped = 0
