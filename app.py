@@ -6,6 +6,7 @@ import random
 import re
 import urllib.parse
 import urllib3
+from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 
@@ -27,7 +28,7 @@ CONFIG = {
     # Anti-ban / Speed Optimization
     'cooldown_every_pages': 5, # প্রতি ৫ পেজ পর ব্রেক
     'cooldown_seconds': 15,    # ১৫ সেকেন্ড ব্রেক
-    'max_threads': 8,          # একসাথে ৮টি এপিসোড ফেচ করবে (Speed up)
+    'max_threads': 5,          # একসাথে ৫টি এপিসোড ফেচ করবে (WAF ব্লক এড়াতে কমানো হয়েছে)
     'max_episodes_limit': 300, # এক সিজনে সর্বোচ্চ ৩০০ এপিসোড ফেচ করবে বা স্কিপ করবে
     
     'always_start_from_page_1': True, # ২২ ঘণ্টা পর পর সব লিংক রিফ্রেশ করার জন্য
@@ -45,8 +46,14 @@ PLAY_API = f"{CONFIG['base_domain']}/wefeed-h5api-bff/subject/play"
 
 # Requests Session - এটি অটোমেটিক কুকি হ্যান্ডেল করবে
 session = requests.Session()
-# মাল্টি-থ্রেডিং এর জন্য কানেকশন পুলিং
-adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+
+# মাল্টি-থ্রেডিং এর জন্য কানেকশন পুলিং এবং রিট্রাই মেকানিজম (WAF ব্লক এড়াতে)
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504]
+)
+adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retry_strategy)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
@@ -170,6 +177,9 @@ def format_episode_dict(ep_num, stream_info, poster):
     }
 
 def fetch_episode_worker(movie_id, s_num, e_num, detail_path, poster):
+    # WAF Jitter: থ্রেডগুলো যেন একদম একই মিলিসেকেন্ডে হিট না করে (Anti-ban)
+    time.sleep(random.uniform(0.1, 0.4))
+    
     stream_info = None
     attempts = 0
     
@@ -177,11 +187,15 @@ def fetch_episode_worker(movie_id, s_num, e_num, detail_path, poster):
         stream_info = fetch_stream_url_only(movie_id, s_num, e_num, detail_path)
         if not stream_info:
             attempts += 1
-            if attempts < 3: time.sleep(0.15)
+            if attempts < 3: time.sleep(0.3)
             
-    # Fallback for S0E0 Movie format if exactly 1 episode
+    # Fallback 1: S0E0 Movie format (If exactly 1 episode)
     if not stream_info and s_num == 1 and e_num == 1:
         stream_info = fetch_stream_url_only(movie_id, 0, 0, detail_path)
+        
+    # Fallback 2: S1E0 format (Sometimes single episode is internally numbered 0 instead of 1)
+    if not stream_info and e_num == 1:
+        stream_info = fetch_stream_url_only(movie_id, s_num, 0, detail_path)
         
     if stream_info and stream_info.get('url'):
         print(f"E{e_num}✓ ", end="", flush=True)
@@ -253,32 +267,31 @@ def fetch_series_seasons_and_episodes(movie):
                     episodes_data_map[ep_num] = format_episode_dict(ep_num, stream_info, poster)
                     
         # Step 2: Threaded Smart Probing (Up to MAX 300 Limit)
-        # For cases where API says 1 episode, but there are actually more.
-        if len(episodes_data_map) > 0:
-            probe_start = e_count + 1
-            consecutive_fails = 0
+        # ALWAYS probe at least 5 episodes ahead, even if E1 failed or episodes_data_map is empty.
+        probe_start = max(1, e_count) + 1
+        consecutive_fails = 0
+        
+        # Stop unconditionally at max limit or after 10 continuous misses
+        while probe_start <= CONFIG['max_episodes_limit'] and consecutive_fails < 10:
+            # Batch of 5 episodes at a time
+            batch_end = min(probe_start + 5, CONFIG['max_episodes_limit'] + 1)
+            probe_batch = list(range(probe_start, batch_end))
+            batch_success = False
             
-            # Stop unconditionally at max limit or after 10 continuous misses
-            while probe_start <= CONFIG['max_episodes_limit'] and consecutive_fails < 10:
-                # Batch of 5 episodes at a time
-                batch_end = min(probe_start + 5, CONFIG['max_episodes_limit'] + 1)
-                probe_batch = list(range(probe_start, batch_end))
-                batch_success = False
+            with ThreadPoolExecutor(max_workers=min(len(probe_batch), CONFIG['max_threads'])) as executor:
+                futures = {executor.submit(fetch_episode_worker, movie_id, s_num, ep, detail_path, poster): ep for ep in probe_batch}
+                for future in as_completed(futures):
+                    ep_num, stream_info = future.result()
+                    if stream_info:
+                        episodes_data_map[ep_num] = format_episode_dict(ep_num, stream_info, poster)
+                        batch_success = True
+                        
+            if not batch_success:
+                consecutive_fails += len(probe_batch)
+            else:
+                consecutive_fails = 0
                 
-                with ThreadPoolExecutor(max_workers=len(probe_batch)) as executor:
-                    futures = {executor.submit(fetch_episode_worker, movie_id, s_num, ep, detail_path, poster): ep for ep in probe_batch}
-                    for future in as_completed(futures):
-                        ep_num, stream_info = future.result()
-                        if stream_info:
-                            episodes_data_map[ep_num] = format_episode_dict(ep_num, stream_info, poster)
-                            batch_success = True
-                            
-                if not batch_success:
-                    consecutive_fails += len(probe_batch)
-                else:
-                    consecutive_fails = 0
-                    
-                probe_start += len(probe_batch)
+            probe_start += len(probe_batch)
                 
         # Finalize and sort Season
         if episodes_data_map:
