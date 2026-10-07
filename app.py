@@ -400,8 +400,20 @@ def main():
         if not response:
             consecutive_failures += 1
             print(f" -> API request failed. Attempt {consecutive_failures}/5.")
+            
+            # ২ বার ফেইল হলে নতুন করে টোকেন নেওয়ার চেষ্টা করবে
+            if consecutive_failures == 2:
+                print("🔄 [INFO] Attempting to refresh session/token...")
+                auto_fetch_token()
+                
             if consecutive_failures >= 5:
-                print("🛑 [STOP] Too many consecutive API failures. IP might be blocked. Pausing script.")
+                # যদি পেজ নম্বর ১০০ এর বেশি হয় এবং ৪০০ এরর দেয়, তারমানে ডাটা শেষ।
+                if page > 100:
+                    print(f"🎉 [COMPLETE] Reached API maximum pagination limit at page {page}. No more data available!")
+                    if os.path.exists(CONFIG['progress_file']):
+                        os.remove(CONFIG['progress_file']) 
+                else:
+                    print("🛑 [STOP] Too many consecutive API failures. IP might be blocked. Pausing script.")
                 break
             time.sleep(10)
             continue
