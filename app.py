@@ -6,6 +6,8 @@ import random
 import re
 import urllib.parse
 import urllib3
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
 
 # SSL Warning হাইড করার জন্য
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -22,9 +24,11 @@ CONFIG = {
     'min_delay_ms': 800,
     'max_delay_ms': 1500,
     
-    # Anti-ban Cooldown
+    # Anti-ban / Speed Optimization
     'cooldown_every_pages': 5, # প্রতি ৫ পেজ পর ব্রেক
     'cooldown_seconds': 15,    # ১৫ সেকেন্ড ব্রেক
+    'max_threads': 8,          # একসাথে ৮টি এপিসোড ফেচ করবে (Speed up)
+    'max_episodes_limit': 300, # এক সিজনে সর্বোচ্চ ৩০০ এপিসোড ফেচ করবে বা স্কিপ করবে
     
     'strict_series_only': True, # শুধু সিরিজ সেভ করবে, মুভি বাতিল করবে
     
@@ -40,6 +44,11 @@ PLAY_API = f"{CONFIG['base_domain']}/wefeed-h5api-bff/subject/play"
 
 # Requests Session - এটি অটোমেটিক কুকি হ্যান্ডেল করবে
 session = requests.Session()
+# মাল্টি-থ্রেডিং এর জন্য কানেকশন পুলিং
+adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+session.mount('http://', adapter)
+session.mount('https://', adapter)
+
 jwt_token = ""
 
 def get_stealth_headers(token=""):
@@ -64,9 +73,7 @@ def auto_fetch_token():
     global jwt_token
     print("ℹ️  Fetching initial session and auth tokens...")
     try:
-        # হোমপেজে হিট করে কুকিজ নেওয়া
         session.get(CONFIG['base_domain'], headers=get_stealth_headers(), verify=False, timeout=15)
-        # কুকি থেকে mb_token খোঁজা
         token = session.cookies.get('mb_token', '')
         if token:
             jwt_token = token
@@ -145,6 +152,43 @@ def fetch_stream_url_only(movie_id, se, ep, detail_path):
     except Exception:
         return None
 
+def format_episode_dict(ep_num, stream_info, poster):
+    return {
+        "downStatus": "off",
+        "downUrl": stream_info['url'],
+        "duration": "--:--",
+        "episode_title": f"E{ep_num}",
+        "headers": {
+            "Referer": f"{CONFIG['base_domain']}/",
+            "Origin": "",
+            "User-Agent": get_stealth_headers()['User-Agent']
+        },
+        "posterUrl": poster,
+        "streamUrl": stream_info['url'],
+        "view": 0
+    }
+
+def fetch_episode_worker(movie_id, s_num, e_num, detail_path, poster):
+    stream_info = None
+    attempts = 0
+    
+    while attempts < 3 and not stream_info:
+        stream_info = fetch_stream_url_only(movie_id, s_num, e_num, detail_path)
+        if not stream_info:
+            attempts += 1
+            if attempts < 3: time.sleep(0.15)
+            
+    # Fallback for S0E0 Movie format if exactly 1 episode
+    if not stream_info and s_num == 1 and e_num == 1:
+        stream_info = fetch_stream_url_only(movie_id, 0, 0, detail_path)
+        
+    if stream_info and stream_info.get('url'):
+        print(f"E{e_num}✓ ", end="", flush=True)
+        return e_num, stream_info
+    else:
+        print(f"E{e_num}✗ ", end="", flush=True)
+        return e_num, None
+
 def fetch_series_seasons_and_episodes(movie):
     movie_id = str(movie.get('subjectId') or movie.get('id', ''))
     title = movie.get('title') or movie.get('name', 'Unknown')
@@ -189,92 +233,58 @@ def fetch_series_seasons_and_episodes(movie):
         s_num = s_obj['season']
         e_count = s_obj['episodeCount']
         
-        episodes_array = []
+        # 300 EPISODES LIMIT CONDITION
+        if e_count > CONFIG['max_episodes_limit']:
+            print(f"\n        └─ Season {s_num}: SKIPPED (Episode count {e_count} exceeds {CONFIG['max_episodes_limit']} max limit)")
+            continue
+            
         print(f"\n        └─ Season {s_num} (Target: {e_count} Eps): ", end="", flush=True)
+        episodes_data_map = {}
         
-        for e_num in range(1, e_count + 1):
-            stream_info = None
-            attempts = 0
-            
-            # Retry logic for 3 attempts
-            while attempts < 3 and not stream_info:
-                stream_info = fetch_stream_url_only(movie_id, s_num, e_num, detail_path)
-                if not stream_info:
-                    attempts += 1
-                    if attempts < 3: time.sleep(0.15)
+        # Step 1: Threaded fetching for known episodes
+        episodes_to_fetch = list(range(1, e_count + 1))
+        with ThreadPoolExecutor(max_workers=CONFIG['max_threads']) as executor:
+            futures = {executor.submit(fetch_episode_worker, movie_id, s_num, ep, detail_path, poster): ep for ep in episodes_to_fetch}
+            for future in as_completed(futures):
+                ep_num, stream_info = future.result()
+                if stream_info:
+                    overall_quality = stream_info['quality']
+                    episodes_data_map[ep_num] = format_episode_dict(ep_num, stream_info, poster)
                     
-            # Fallback for S0E0 Movie format if exactly 1 episode
-            if not stream_info and s_num == 1 and e_num == 1:
-                stream_info = fetch_stream_url_only(movie_id, 0, 0, detail_path)
-                
-            if stream_info and stream_info.get('url'):
-                overall_quality = stream_info['quality']
-                ep_title = f"E{e_num}"
-                
-                episodes_array.append({
-                    "downStatus": "off",
-                    "downUrl": stream_info['url'],
-                    "duration": "--:--",
-                    "episode_title": ep_title,
-                    "headers": {
-                        "Referer": f"{CONFIG['base_domain']}/",
-                        "Origin": "",
-                        "User-Agent": get_stealth_headers()['User-Agent']
-                    },
-                    "posterUrl": poster,
-                    "streamUrl": stream_info['url'],
-                    "view": 0
-                })
-                print(f"E{e_num}✓ ", end="", flush=True)
-            else:
-                print(f"E{e_num}✗ ", end="", flush=True)
-                
-            time.sleep(0.12) # 120ms delay
-            
-        # Extra episode prober: API often reports incorrect low episode counts (e.g. 1)
-        if len(episodes_array) > 0:
-            probe = e_count + 1
+        # Step 2: Threaded Smart Probing (Up to MAX 300 Limit)
+        # For cases where API says 1 episode, but there are actually more.
+        if len(episodes_data_map) > 0:
+            probe_start = e_count + 1
             consecutive_fails = 0
-            while probe <= 5000: # Limit increased to 5000 episodes
-                stream_info = None
-                attempts = 0
+            
+            # Stop unconditionally at max limit or after 10 continuous misses
+            while probe_start <= CONFIG['max_episodes_limit'] and consecutive_fails < 10:
+                # Batch of 5 episodes at a time
+                batch_end = min(probe_start + 5, CONFIG['max_episodes_limit'] + 1)
+                probe_batch = list(range(probe_start, batch_end))
+                batch_success = False
                 
-                # Retry logic for probe attempts
-                while attempts < 3 and not stream_info:
-                    stream_info = fetch_stream_url_only(movie_id, s_num, probe, detail_path)
-                    if not stream_info:
-                        attempts += 1
-                        if attempts < 3: time.sleep(0.15)
-
-                if stream_info and stream_info.get('url'):
-                    episodes_array.append({
-                        "downStatus": "off",
-                        "downUrl": stream_info['url'],
-                        "duration": "--:--",
-                        "episode_title": f"E{probe}",
-                        "headers": {
-                            "Referer": f"{CONFIG['base_domain']}/",
-                            "Origin": "",
-                            "User-Agent": get_stealth_headers()['User-Agent']
-                        },
-                        "posterUrl": poster,
-                        "streamUrl": stream_info['url'],
-                        "view": 0
-                    })
-                    print(f"E{probe}✓ ", end="", flush=True)
-                    consecutive_fails = 0
+                with ThreadPoolExecutor(max_workers=len(probe_batch)) as executor:
+                    futures = {executor.submit(fetch_episode_worker, movie_id, s_num, ep, detail_path, poster): ep for ep in probe_batch}
+                    for future in as_completed(futures):
+                        ep_num, stream_info = future.result()
+                        if stream_info:
+                            episodes_data_map[ep_num] = format_episode_dict(ep_num, stream_info, poster)
+                            batch_success = True
+                            
+                if not batch_success:
+                    consecutive_fails += len(probe_batch)
                 else:
-                    consecutive_fails += 1
-                    if consecutive_fails >= 10:  # টানা ১০ টা এপিসোড না পেলে তবেই থামবে
-                        break
+                    consecutive_fails = 0
+                    
+                probe_start += len(probe_batch)
                 
-                probe += 1
-                time.sleep(0.15)
-        
-        if episodes_array:
+        # Finalize and sort Season
+        if episodes_data_map:
+            sorted_eps = [episodes_data_map[k] for k in sorted(episodes_data_map.keys())]
             seasons_array.append({
                 "season_title": f"Season {s_num}",
-                "episodes": episodes_array
+                "episodes": sorted_eps
             })
 
     return {
@@ -339,17 +349,15 @@ def format_to_desired_json(movie, series_data):
 
 def main():
     print("====================================================")
-    print("    MovieBox TV Series Auto Scraper (Python Edition)")
+    print("    MovieBox TV Series Auto Scraper (Fast Edition)  ")
     print("====================================================")
     
-    # প্রথমে টোকেন ও সেশন কুকিজ নেওয়া
     auto_fetch_token()
     
     all_series = []
     series_map = {}
     seen_in_this_run = set()
     
-    # বিদ্যমান ডাটা লোড করা (যাতে ডুপ্লিকেট না হয়)
     if os.path.exists(CONFIG['output_file']):
         try:
             with open(CONFIG['output_file'], 'r', encoding='utf-8') as f:
@@ -362,7 +370,6 @@ def main():
         except Exception as e:
             print(f"[WARN] Error reading existing JSON: {e}")
             
-    # Resume Logic - প্রগ্রেস ফাইল চেক করা
     page = CONFIG['start_page']
     if os.path.exists(CONFIG['progress_file']):
         try:
@@ -399,7 +406,7 @@ def main():
             time.sleep(10)
             continue
             
-        consecutive_failures = 0 # রিকোয়েস্ট সাকসেস হলে ফেইল কাউন্ট জিরো
+        consecutive_failures = 0 
         
         items = response.get('data', {}).get('list') or response.get('data', {}).get('items', [])
         count = len(items)
@@ -408,7 +415,7 @@ def main():
         if count == 0:
             print("🎉 [COMPLETE] No more series left! Reached the end.")
             if os.path.exists(CONFIG['progress_file']):
-                os.remove(CONFIG['progress_file']) # কাজ শেষ, তাই প্রগ্রেস ডিলিট
+                os.remove(CONFIG['progress_file']) 
             break
             
         processed_this_page = 0
@@ -420,7 +427,6 @@ def main():
             if not mid or mid in seen_in_this_run: continue
             seen_in_this_run.add(mid)
             
-            # Strict Validation (লিস্ট থেকে মুভি বাদ দেওয়া)
             if CONFIG['strict_series_only']:
                 if int(movie.get('subjectType', 2)) == 1:
                     print(f"   ▶ {title} [Skipped - Identified as Movie]")
@@ -435,7 +441,7 @@ def main():
                 print("\n      [Skipped - Validated as Movie]")
                 continue
             if not series_data.get('seasons'):
-                print("\n      [No stream link - Skipped]")
+                print("\n      [No stream link or Skipped due to limit]")
                 continue
                 
             formatted = format_to_desired_json(movie, series_data)
@@ -449,14 +455,12 @@ def main():
                 series_map[formatted['title']] = len(all_series) - 1
                 print("\n      [Success - Added New Series]")
                 
-            # ডাটা সেভ করা
             with open(CONFIG['output_file'], 'w', encoding='utf-8') as f:
                 json.dump(all_series, f, indent=4, ensure_ascii=False)
                 
         if processed_this_page == 0 and count > 0:
             print("🛑 [NOTICE] All items on this page were skipped (Movies detected).")
             
-        # পেজ সেভ করা
         with open(CONFIG['progress_file'], 'w') as f:
             f.write(str(page + 1))
             
